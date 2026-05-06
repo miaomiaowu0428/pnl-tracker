@@ -1,0 +1,16 @@
+[package]
+name = "pnl-tracker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+grpc-client = { git = "https://github.com/miaomiaowu0428/grpc-client.git" }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+solana-sdk = "3.0.0"
+tokio = { version = "1", features = ["sync"] }
+transaction-monitor = { git = "https://github.com/miaomiaowu0428/transaction-monitor.git" }
+utils = { git = "https://github.com/miaomiaowu0428/sol-utils.git" }
+bincode = "1"
+sled = "0.34"
