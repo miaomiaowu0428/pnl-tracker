@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use grpc_client::TransactionFormat;
+use heed::types::{Bytes, SerdeBincode};
+use heed::{Database, Env};
 use log::warn;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
@@ -74,7 +76,31 @@ impl TokenPnl {
 pub struct PnlTracker {
     targets: RwLock<HashSet<Pubkey>>,
     cache: RwLock<HashMap<(Pubkey, Pubkey), TokenPnl>>,
-    db: Option<sled::Db>,
+    db: Option<PnlDb>,
+}
+
+struct PnlDb {
+    env: Env,
+    db: Database<Bytes, SerdeBincode<TokenPnl>>,
+}
+
+impl PnlDb {
+    fn open(path: &PathBuf) -> Result<Self, String> {
+        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        let env = unsafe {
+            heed::EnvOpenOptions::new()
+                .map_size(256 * 1024 * 1024)
+                .max_dbs(1)
+                .open(path)
+                .map_err(|e| e.to_string())?
+        };
+        let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
+        let db = env
+            .create_database(&mut wtxn, Some("pnl_tracker"))
+            .map_err(|e| e.to_string())?;
+        wtxn.commit().map_err(|e| e.to_string())?;
+        Ok(Self { env, db })
+    }
 }
 
 impl Default for PnlTracker {
@@ -90,7 +116,7 @@ impl PnlTracker {
 
     pub fn with_db_path(path: Option<PathBuf>) -> Self {
         let db_path = path.unwrap_or_else(|| PathBuf::from("./data/pnl"));
-        let db = match sled::open(&db_path) {
+        let db = match PnlDb::open(&db_path) {
             Ok(db) => Some(db),
             Err(e) => {
                 warn!(
@@ -104,9 +130,23 @@ impl PnlTracker {
 
         let mut cache = HashMap::new();
         if let Some(db_ref) = db.as_ref() {
-            for item in db_ref.iter() {
-                let Ok((key, value)) = item else { continue };
-                let Ok(key_str) = std::str::from_utf8(&key) else {
+            let Ok(rtxn) = db_ref.env.read_txn() else {
+                return Self {
+                    targets: RwLock::new(HashSet::new()),
+                    cache: RwLock::new(cache),
+                    db,
+                };
+            };
+            let Ok(iter) = db_ref.db.iter(&rtxn) else {
+                return Self {
+                    targets: RwLock::new(HashSet::new()),
+                    cache: RwLock::new(cache),
+                    db,
+                };
+            };
+            for item in iter {
+                let Ok((key, pnl)) = item else { continue };
+                let Ok(key_str) = std::str::from_utf8(key) else {
                     continue;
                 };
                 let Some((payer_str, mint_str)) = key_str.split_once(':') else {
@@ -115,9 +155,6 @@ impl PnlTracker {
                 let (Ok(payer), Ok(mint)) =
                     (payer_str.parse::<Pubkey>(), mint_str.parse::<Pubkey>())
                 else {
-                    continue;
-                };
-                let Ok(pnl) = bincode::deserialize::<TokenPnl>(&value) else {
                     continue;
                 };
                 cache.insert((payer, mint), pnl);
@@ -250,11 +287,12 @@ impl PnlTracker {
         );
 
         if let Some(db) = self.db.as_ref()
-            && let Ok(value) = bincode::serialize(stat)
         {
             let key = format!("{}:{}", target, base_change.mint);
-            let _ = db.insert(key.as_bytes(), value);
-            let _ = db.flush();
+            if let Ok(mut wtxn) = db.env.write_txn() {
+                let _ = db.db.put(&mut wtxn, key.as_bytes(), stat);
+                let _ = wtxn.commit();
+            }
         }
     }
 }
