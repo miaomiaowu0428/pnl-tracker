@@ -38,6 +38,10 @@ pub struct TokenPnl {
     pub quote_mint: String,
     pub success_tx_count: usize,
     pub last_slot: u64,
+    #[serde(default)]
+    pub base_position: i128,
+    #[serde(default)]
+    pub last_base_after_balance: u64,
 }
 
 impl TokenPnl {
@@ -46,6 +50,8 @@ impl TokenPnl {
         quote_change: i128,
         buy_cost_delta: i128,
         sol_gas: i128,
+        base_change: i128,
+        base_after_balance: u64,
         quote_mint: Pubkey,
         payer: Pubkey,
         slot: u64,
@@ -53,6 +59,8 @@ impl TokenPnl {
         self.quote_pnl += quote_change;
         self.buy_cost_total += buy_cost_delta;
         self.sol_gas_cost += sol_gas;
+        self.base_position += base_change;
+        self.last_base_after_balance = base_after_balance;
         self.success_tx_count += 1;
         self.last_slot = slot;
 
@@ -71,6 +79,26 @@ impl TokenPnl {
     pub fn is_sol_based(&self) -> bool {
         self.quote_mint == Pubkey::default().to_string() || self.quote_mint == WSOL
     }
+
+    pub fn is_settled(&self) -> bool {
+        self.success_tx_count >= 1
+            && self.buy_cost_total > 0
+            && self.last_base_after_balance == 0
+            && self.base_position <= 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettledTokenPnlDetail {
+    pub payer: String,
+    pub mint: String,
+    pub quote_mint: String,
+    pub quote_pnl: i128,
+    pub buy_cost_total: i128,
+    pub sol_gas_cost: i128,
+    pub return_pct: Option<f64>,
+    pub success_tx_count: usize,
+    pub last_slot: u64,
 }
 
 pub struct PnlTracker {
@@ -130,34 +158,24 @@ impl PnlTracker {
 
         let mut cache = HashMap::new();
         if let Some(db_ref) = db.as_ref() {
-            let Ok(rtxn) = db_ref.env.read_txn() else {
-                return Self {
-                    targets: RwLock::new(HashSet::new()),
-                    cache: RwLock::new(cache),
-                    db,
-                };
-            };
-            let Ok(iter) = db_ref.db.iter(&rtxn) else {
-                return Self {
-                    targets: RwLock::new(HashSet::new()),
-                    cache: RwLock::new(cache),
-                    db,
-                };
-            };
-            for item in iter {
-                let Ok((key, pnl)) = item else { continue };
-                let Ok(key_str) = std::str::from_utf8(key) else {
-                    continue;
-                };
-                let Some((payer_str, mint_str)) = key_str.split_once(':') else {
-                    continue;
-                };
-                let (Ok(payer), Ok(mint)) =
-                    (payer_str.parse::<Pubkey>(), mint_str.parse::<Pubkey>())
-                else {
-                    continue;
-                };
-                cache.insert((payer, mint), pnl);
+            if let Ok(rtxn) = db_ref.env.read_txn()
+                && let Ok(iter) = db_ref.db.iter(&rtxn)
+            {
+                for item in iter {
+                    let Ok((key, pnl)) = item else { continue };
+                    let Ok(key_str) = std::str::from_utf8(key) else {
+                        continue;
+                    };
+                    let Some((payer_str, mint_str)) = key_str.split_once(':') else {
+                        continue;
+                    };
+                    let (Ok(payer), Ok(mint)) =
+                        (payer_str.parse::<Pubkey>(), mint_str.parse::<Pubkey>())
+                    else {
+                        continue;
+                    };
+                    cache.insert((payer, mint), pnl);
+                }
             }
         }
 
@@ -215,6 +233,29 @@ impl PnlTracker {
 
     pub async fn query_token_pnl(&self, payer: &Pubkey, mint: &Pubkey) -> Option<TokenPnl> {
         self.cache.read().await.get(&(*payer, *mint)).cloned()
+    }
+
+    pub async fn query_settled_token_pnl_detail(
+        &self,
+        payer: &Pubkey,
+        mint: &Pubkey,
+    ) -> Option<SettledTokenPnlDetail> {
+        let pnl = self.query_token_pnl(payer, mint).await?;
+        if !pnl.is_settled() {
+            return None;
+        }
+        let return_pct = (pnl.buy_cost_total > 0).then_some(pnl.quote_pnl as f64 / pnl.buy_cost_total as f64);
+        Some(SettledTokenPnlDetail {
+            payer: payer.to_string(),
+            mint: mint.to_string(),
+            quote_mint: pnl.quote_mint,
+            quote_pnl: pnl.quote_pnl,
+            buy_cost_total: pnl.buy_cost_total,
+            sol_gas_cost: pnl.sol_gas_cost,
+            return_pct,
+            success_tx_count: pnl.success_tx_count,
+            last_slot: pnl.last_slot,
+        })
     }
 
     pub async fn query_payer_pnl(&self, payer: &Pubkey) -> HashMap<Pubkey, TokenPnl> {
@@ -281,6 +322,8 @@ impl PnlTracker {
             quote_change.change,
             buy_cost_delta,
             sol_gas,
+            base_change.change,
+            base_change.after_balance,
             quote_mint,
             target,
             slot,
@@ -361,6 +404,15 @@ pub async fn list_targets() -> Vec<Pubkey> {
 
 pub async fn query_token_pnl(payer: &Pubkey, mint: &Pubkey) -> Option<TokenPnl> {
     global_tracker().query_token_pnl(payer, mint).await
+}
+
+pub async fn query_settled_token_pnl_detail(
+    payer: &Pubkey,
+    mint: &Pubkey,
+) -> Option<SettledTokenPnlDetail> {
+    global_tracker()
+        .query_settled_token_pnl_detail(payer, mint)
+        .await
 }
 
 #[async_trait::async_trait]
