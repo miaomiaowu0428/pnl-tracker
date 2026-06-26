@@ -244,7 +244,8 @@ impl PnlTracker {
         if !pnl.is_settled() {
             return None;
         }
-        let return_pct = (pnl.buy_cost_total > 0).then_some(pnl.quote_pnl as f64 / pnl.buy_cost_total as f64);
+        let return_pct =
+            (pnl.buy_cost_total > 0).then_some(pnl.quote_pnl as f64 / pnl.buy_cost_total as f64);
         Some(SettledTokenPnlDetail {
             payer: payer.to_string(),
             mint: mint.to_string(),
@@ -329,12 +330,20 @@ impl PnlTracker {
             slot,
         );
 
-        if let Some(db) = self.db.as_ref()
-        {
+        if let Some(db) = self.db.as_ref() {
             let key = format!("{}:{}", target, base_change.mint);
-            if let Ok(mut wtxn) = db.env.write_txn() {
-                let _ = db.db.put(&mut wtxn, key.as_bytes(), stat);
-                let _ = wtxn.commit();
+            match db.env.write_txn() {
+                Ok(mut wtxn) => {
+                    if let Err(e) = db.db.put(&mut wtxn, key.as_bytes(), stat) {
+                        warn!("[pnl-tracker] LMDB put failed key={} err={}", key, e);
+                    }
+                    if let Err(e) = wtxn.commit() {
+                        warn!("[pnl-tracker] LMDB commit failed key={} err={}", key, e);
+                    }
+                }
+                Err(e) => {
+                    warn!("[pnl-tracker] LMDB write_txn failed key={} err={}", key, e);
+                }
             }
         }
     }
@@ -350,6 +359,9 @@ fn select_quote_change(changes: &[BalanceChange]) -> (Pubkey, BalanceChange) {
                     if let Some(combined) = sol.combine(wsol) {
                         return (Pubkey::default(), combined);
                     }
+                    // combine 失败时 fallback：取变化量较大的一方
+                    let pick = if sol.change.abs() >= wsol.change.abs() { sol } else { wsol };
+                    return (Pubkey::default(), pick.clone());
                 }
                 (Some(sol), None) => return (Pubkey::default(), sol.clone()),
                 (None, Some(wsol)) => return (Pubkey::default(), wsol.clone()),
