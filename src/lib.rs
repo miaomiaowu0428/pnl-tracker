@@ -5,10 +5,12 @@ use std::sync::{Arc, LazyLock};
 use grpc_client::TransactionFormat;
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, Env};
-use log::warn;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
+use tokio::time::Duration;
 use transaction_monitor::tx_subscriber::TxSubscriber;
 use utils::balance_change::balance_changes_of_grpc;
 use utils::parse_rpc_fetched_json::BalanceChange;
@@ -105,6 +107,7 @@ pub struct PnlTracker {
     targets: RwLock<HashSet<Pubkey>>,
     cache: RwLock<HashMap<(Pubkey, Pubkey), TokenPnl>>,
     db: Option<PnlDb>,
+    latest_slot: AtomicU64,
 }
 
 struct PnlDb {
@@ -183,6 +186,7 @@ impl PnlTracker {
             targets: RwLock::new(HashSet::new()),
             cache: RwLock::new(cache),
             db,
+            latest_slot: AtomicU64::new(0),
         }
     }
 
@@ -213,6 +217,7 @@ impl PnlTracker {
     }
 
     pub async fn process_tx(&self, tx: &TransactionFormat) -> Result<(), String> {
+        self.latest_slot.fetch_max(tx.slot, Ordering::Relaxed);
         let changes = balance_changes_of_grpc(tx).map_err(|e| e.to_string())?;
         if changes.is_empty() {
             return Ok(());
@@ -276,6 +281,83 @@ impl PnlTracker {
 
     pub async fn query_all_pnl(&self) -> HashMap<(Pubkey, Pubkey), TokenPnl> {
         self.cache.read().await.clone()
+    }
+
+    /// GC：删除超过 `ttl_slots` 未更新的条目（内存 + LMDB）。
+    /// 默认 TTL = 216_000 slots（~1 天）。
+    pub async fn gc(&self, ttl_slots: u64) -> usize {
+        let current = self.latest_slot.load(Ordering::Relaxed);
+        if current < ttl_slots {
+            return 0; // 刚启动，slot 还不够
+        }
+        let cutoff = current.saturating_sub(ttl_slots);
+
+        // 1. 内存清理
+        let stale_keys: Vec<(Pubkey, Pubkey)> = {
+            self.cache
+                .read()
+                .await
+                .iter()
+                .filter(|(_, pnl)| pnl.last_slot < cutoff)
+                .map(|(k, _)| *k)
+                .collect()
+        };
+
+        let mut cache = self.cache.write().await;
+        for key in &stale_keys {
+            cache.remove(key);
+        }
+        drop(cache);
+
+        // 2. LMDB 清理
+        let mut db_removed = 0usize;
+        if let Some(db) = self.db.as_ref() {
+            let stale_db_keys: Vec<String> = {
+                let mut keys = Vec::new();
+                if let Ok(rtxn) = db.env.read_txn()
+                    && let Ok(iter) = db.db.iter(&rtxn)
+                {
+                    for item in iter {
+                        let Ok((key_bytes, pnl)) = item else { continue };
+                        if pnl.last_slot < cutoff {
+                            if let Ok(key_str) = std::str::from_utf8(key_bytes) {
+                                keys.push(key_str.to_string());
+                            }
+                        }
+                    }
+                }
+                keys
+            };
+
+            if !stale_db_keys.is_empty() {
+                match db.env.write_txn() {
+                    Ok(mut wtxn) => {
+                        for key_str in &stale_db_keys {
+                            let _ = db.db.delete(&mut wtxn, key_str.as_bytes());
+                            db_removed += 1;
+                        }
+                        if let Err(e) = wtxn.commit() {
+                            warn!("[pnl-tracker] GC LMDB commit failed: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[pnl-tracker] GC LMDB write_txn failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        let total = stale_keys.len() + db_removed;
+        if total > 0 {
+            info!(
+                "[pnl-tracker] GC removed {} entries (mem={}, db={}, cutoff_slot={})",
+                total,
+                stale_keys.len(),
+                db_removed,
+                cutoff
+            );
+        }
+        total
     }
 
     async fn apply_changes_for_target(&self, slot: u64, target: Pubkey, changes: &[BalanceChange]) {
@@ -425,6 +507,24 @@ pub async fn query_settled_token_pnl_detail(
     global_tracker()
         .query_settled_token_pnl_detail(payer, mint)
         .await
+}
+
+/// 启动后台 GC 任务：每 10 分钟清理超过 TTL（默认 ~1 天 = 216000 slots）的条目。
+pub fn spawn_gc_task(ttl_slots: Option<u64>) {
+    let ttl = ttl_slots.unwrap_or(216_000); // 默认 ~1 天
+    let tracker = global_tracker();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(600)); // 每 10 分钟
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // 跳过第一次 tick（启动时 slot 可能为 0）
+        loop {
+            interval.tick().await;
+            let removed = tracker.gc(ttl).await;
+            if removed > 0 {
+                info!("[pnl-tracker] GC cycle removed {} entries", removed);
+            }
+        }
+    });
 }
 
 #[async_trait::async_trait]
