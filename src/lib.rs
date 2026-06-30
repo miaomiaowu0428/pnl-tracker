@@ -108,8 +108,8 @@ pub struct PnlTracker {
     cache: RwLock<HashMap<(Pubkey, Pubkey), TokenPnl>>,
     db: Option<PnlDb>,
     latest_slot: AtomicU64,
-    /// 清仓结算回调：key=payer，仓位清零时调用对应 payer 的所有回调
-    settle_callbacks: RwLock<HashMap<Pubkey, Vec<Arc<dyn Fn(Pubkey, Pubkey, TokenPnl) + Send + Sync>>>>,
+    /// 清仓结算回调：key=payer，仓位清零时 spawn 对应 payer 的所有回调
+    settle_callbacks: RwLock<HashMap<Pubkey, Vec<Arc<dyn Fn(Pubkey, Pubkey, TokenPnl) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>>>>,
 }
 
 struct PnlDb {
@@ -286,19 +286,18 @@ impl PnlTracker {
         self.cache.read().await.clone()
     }
 
-    /// 注册清仓结算回调。仅当 `payer` 的仓位清零时触发 fn(payer, mint, TokenPnl)。
-    /// 回调在 write lock 外异步执行，应尽量轻量。
-    pub async fn on_settle<F: Fn(Pubkey, Pubkey, TokenPnl) + Send + Sync + 'static>(
-        &self,
-        payer: Pubkey,
-        f: F,
-    ) {
+    /// 注册清仓结算回调（async）。仅当 `payer` 的仓位清零时 spawn 回调。
+    pub async fn on_settle<F, Fut>(&self, payer: Pubkey, f: F)
+    where
+        F: Fn(Pubkey, Pubkey, TokenPnl) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         self.settle_callbacks
             .write()
             .await
             .entry(payer)
             .or_default()
-            .push(Arc::new(f));
+            .push(Arc::new(move |p, m, t| Box::pin(f(p, m, t))));
     }
 
     /// GC：删除超过 `ttl_slots` 未更新的条目（内存 + LMDB）。
@@ -460,7 +459,9 @@ impl PnlTracker {
                 let payer = target;
                 let mint = base_change.mint;
                 for cb in payer_cbs.iter() {
-                    cb(payer, mint, payload.clone());
+                    let cb = cb.clone();
+                    let p = payload.clone();
+                    tokio::spawn(async move { cb(payer, mint, p).await });
                 }
             }
         }
@@ -545,11 +546,12 @@ pub async fn query_settled_token_pnl_detail(
         .await
 }
 
-/// 注册清仓结算回调（全局，指定 payer）。
-pub async fn on_settle<F: Fn(Pubkey, Pubkey, TokenPnl) + Send + Sync + 'static>(
-    payer: Pubkey,
-    f: F,
-) {
+/// 注册清仓结算回调（全局，指定 payer，async）。
+pub async fn on_settle<F, Fut>(payer: Pubkey, f: F)
+where
+    F: Fn(Pubkey, Pubkey, TokenPnl) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     global_tracker().on_settle(payer, f).await;
 }
 

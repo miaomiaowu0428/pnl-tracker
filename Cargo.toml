@@ -9,7 +9,7 @@ grpc-client = { git = "https://github.com/miaomiaowu0428/grpc-client.git" }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 solana-sdk = "3.0.0"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt", "time"] }
 transaction-monitor = { git = "https://github.com/miaomiaowu0428/transaction-monitor.git" }
 utils = { git = "https://github.com/miaomiaowu0428/sol-utils.git" }
 heed = { version = "0.20", features = ["serde-bincode"] }
