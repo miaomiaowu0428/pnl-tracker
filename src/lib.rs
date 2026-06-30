@@ -108,6 +108,8 @@ pub struct PnlTracker {
     cache: RwLock<HashMap<(Pubkey, Pubkey), TokenPnl>>,
     db: Option<PnlDb>,
     latest_slot: AtomicU64,
+    /// 清仓结算回调：key=payer，仓位清零时调用对应 payer 的所有回调
+    settle_callbacks: RwLock<HashMap<Pubkey, Vec<Arc<dyn Fn(Pubkey, Pubkey, TokenPnl) + Send + Sync>>>>,
 }
 
 struct PnlDb {
@@ -187,6 +189,7 @@ impl PnlTracker {
             cache: RwLock::new(cache),
             db,
             latest_slot: AtomicU64::new(0),
+            settle_callbacks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -281,6 +284,21 @@ impl PnlTracker {
 
     pub async fn query_all_pnl(&self) -> HashMap<(Pubkey, Pubkey), TokenPnl> {
         self.cache.read().await.clone()
+    }
+
+    /// 注册清仓结算回调。仅当 `payer` 的仓位清零时触发 fn(payer, mint, TokenPnl)。
+    /// 回调在 write lock 外异步执行，应尽量轻量。
+    pub async fn on_settle<F: Fn(Pubkey, Pubkey, TokenPnl) + Send + Sync + 'static>(
+        &self,
+        payer: Pubkey,
+        f: F,
+    ) {
+        self.settle_callbacks
+            .write()
+            .await
+            .entry(payer)
+            .or_default()
+            .push(Arc::new(f));
     }
 
     /// GC：删除超过 `ttl_slots` 未更新的条目（内存 + LMDB）。
@@ -412,6 +430,10 @@ impl PnlTracker {
             slot,
         );
 
+        let settled = stat.is_settled();
+        let settled_payload = if settled { Some(stat.clone()) } else { None };
+
+        // LMDB 持久化
         if let Some(db) = self.db.as_ref() {
             let key = format!("{}:{}", target, base_change.mint);
             match db.env.write_txn() {
@@ -425,6 +447,20 @@ impl PnlTracker {
                 }
                 Err(e) => {
                     warn!("[pnl-tracker] LMDB write_txn failed key={} err={}", key, e);
+                }
+            }
+        }
+
+        // 释放写锁后再触发回调，避免死锁
+        drop(cache);
+
+        if let Some(payload) = settled_payload {
+            let cbs = self.settle_callbacks.read().await;
+            if let Some(payer_cbs) = cbs.get(&target) {
+                let payer = target;
+                let mint = base_change.mint;
+                for cb in payer_cbs.iter() {
+                    cb(payer, mint, payload.clone());
                 }
             }
         }
@@ -507,6 +543,14 @@ pub async fn query_settled_token_pnl_detail(
     global_tracker()
         .query_settled_token_pnl_detail(payer, mint)
         .await
+}
+
+/// 注册清仓结算回调（全局，指定 payer）。
+pub async fn on_settle<F: Fn(Pubkey, Pubkey, TokenPnl) + Send + Sync + 'static>(
+    payer: Pubkey,
+    f: F,
+) {
+    global_tracker().on_settle(payer, f).await;
 }
 
 /// 启动后台 GC 任务：每 10 分钟清理超过 TTL（默认 ~1 天 = 216000 slots）的条目。
