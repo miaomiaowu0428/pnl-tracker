@@ -5,11 +5,13 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1"
-grpc-client = { git = "https://github.com/miaomiaowu0428/grpc-client.git" }
+grpc-client = { git = "https://github.com/miaomiaowu0428/grpc-client.git", branch = "supportV1" }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
-solana-sdk = "3.0.0"
+solana-sdk = "4.0.1"
 tokio = { version = "1", features = ["sync", "rt", "time"] }
-transaction-monitor = { git = "https://github.com/miaomiaowu0428/transaction-monitor.git" }
-utils = { git = "https://github.com/miaomiaowu0428/sol-utils.git" }
+transaction-monitor = { git = "https://github.com/miaomiaowu0428/transaction-monitor.git", branch = "supportV1" }
+utils = { git = "https://github.com/miaomiaowu0428/sol-utils.git", branch = "supportV1" }
 heed = { version = "0.20", features = ["serde-bincode"] }
+
+[workspace]

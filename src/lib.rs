@@ -20,6 +20,19 @@ const USD1: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
+/// 从 `TransactionFormat` 还原完整账户列表（静态 + ALT 加载）。
+///
+/// 4.x 的 `TransactionFormat` 不再直接存 `account_keys`，需由消息静态键 +
+/// `meta.loaded_addresses` 现算。
+fn keys_of(tx: &TransactionFormat) -> Vec<Pubkey> {
+    let (writable, readonly) = tx
+        .meta
+        .as_ref()
+        .map(|m| (m.loaded_addresses.writable.as_slice(), m.loaded_addresses.readonly.as_slice()))
+        .unwrap_or((&[], &[]));
+    utils::tx_parse::account_keys_of(&tx.transaction.message, writable, readonly)
+}
+
 static WSOL_MINT: LazyLock<Pubkey> = LazyLock::new(|| WSOL.parse().expect("invalid WSOL mint"));
 static QUOTE_CURRENCIES: LazyLock<Vec<Pubkey>> = LazyLock::new(|| {
     vec![
@@ -584,15 +597,14 @@ impl TxSubscriber for PnlTrackerSubscriber {
         if targets.is_empty() {
             return Some(false);
         }
-        Some(tx.account_keys.iter().any(|k| targets.contains(k)))
+        let keys = keys_of(tx);
+        Some(keys.iter().any(|k| targets.contains(k)))
     }
 
     async fn on_tx(self: Arc<Self>, tx: Arc<TransactionFormat>) {
         if let Err(e) = self.tracker.process_tx(&tx).await {
-            warn!(
-                "[PnlTrackerSubscriber] process tx failed sig={} err={}",
-                tx.signature, e
-            );
+            let sig = tx.transaction.signatures.first().copied().unwrap_or_default();
+            warn!("[PnlTrackerSubscriber] process tx failed sig={} err={}", sig, e);
         }
     }
 }
