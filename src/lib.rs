@@ -119,6 +119,12 @@ pub struct SettledTokenPnlDetail {
 pub struct PnlTracker {
     targets: RwLock<HashSet<Pubkey>>,
     cache: RwLock<HashMap<(Pubkey, Pubkey), TokenPnl>>,
+    /// **原生 SOL 余额镜像**：`mint == Pubkey::default()` 的最近一次链上 `after_balance`。
+    ///
+    /// 自有库体系里「SOL」统一用 [`Pubkey::default`] 表示（与 `QUOTE_CURRENCIES` 一致），
+    /// 不会与任何 SPL mint 冲突。给买入侧当 `pre_balance` 快照用 ——
+    /// 省掉热路径里一次 `get_balance` RPC。
+    sol_balances: RwLock<HashMap<Pubkey, u64>>,
     db: Option<PnlDb>,
     latest_slot: AtomicU64,
     /// 清仓结算回调：key=payer，仓位清零时 spawn 对应 payer 的所有回调
@@ -200,6 +206,7 @@ impl PnlTracker {
         Self {
             targets: RwLock::new(HashSet::new()),
             cache: RwLock::new(cache),
+            sol_balances: RwLock::new(HashMap::new()),
             db,
             latest_slot: AtomicU64::new(0),
             settle_callbacks: RwLock::new(HashMap::new()),
@@ -254,6 +261,18 @@ impl PnlTracker {
 
     pub async fn query_token_pnl(&self, payer: &Pubkey, mint: &Pubkey) -> Option<TokenPnl> {
         self.cache.read().await.get(&(*payer, *mint)).cloned()
+    }
+
+    /// 查询 `payer` 的**原生 SOL 余额镜像**（`mint == Pubkey::default()`）。
+    ///
+    /// - `Some(bal)` = 最近一次在链上观察到的该 payer 原生 SOL `after_balance`（lamports）
+    /// - `None`      = 启动后还没观察到该 payer 的任何余额变化（调用方自行回落 RPC）
+    ///
+    /// ⚠️ 这是**事件流镜像**，不是实时账面：它只反映「最后一笔被观察到的交易之后」的余额。
+    /// 作为 `pre_balance` 快照用时方向是安全的 —— 镜像偏旧（偏高）只会让补足量偏小，
+    /// 不会超买；偏新（偏低）才可能超买，那需要该 payer 在两次观察之间**收到** SOL。
+    pub async fn query_sol_balance(&self, payer: &Pubkey) -> Option<u64> {
+        self.sol_balances.read().await.get(payer).copied()
     }
 
     pub async fn query_settled_token_pnl_detail(
@@ -399,6 +418,13 @@ impl PnlTracker {
 
         if self_changes.is_empty() {
             return;
+        }
+
+        // **原生 SOL 余额镜像**：只要本笔有 `mint == Pubkey::default()` 的余额变化就刷新，
+        // 与有没有 base 代币变化无关（wrap / tip / 纯转账 / 租金都要记）。
+        // 放在 `base_change` 早退之前 —— 否则 SOL-only 的交易会被漏掉。
+        if let Some(sol) = self_changes.iter().find(|c| c.mint == Pubkey::default()) {
+            self.sol_balances.write().await.insert(target, sol.after_balance);
         }
 
         let (quote_mint, quote_change) = select_quote_change(&self_changes);
@@ -548,6 +574,13 @@ pub async fn list_targets() -> Vec<Pubkey> {
 
 pub async fn query_token_pnl(payer: &Pubkey, mint: &Pubkey) -> Option<TokenPnl> {
     global_tracker().query_token_pnl(payer, mint).await
+}
+
+/// 查询 `payer` 的原生 SOL 余额镜像（全局 tracker，`mint == Pubkey::default()`）。
+///
+/// `None` = 启动后还没观察过该 payer（调用方自行回落 RPC）。
+pub async fn sol_balance(payer: &Pubkey) -> Option<u64> {
+    global_tracker().query_sol_balance(payer).await
 }
 
 pub async fn query_settled_token_pnl_detail(
