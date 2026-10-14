@@ -57,6 +57,13 @@ pub struct TokenPnl {
     pub base_position: i128,
     #[serde(default)]
     pub last_base_after_balance: u64,
+    /// **`last_base_after_balance` 记在哪个账户上** —— ATA，还是
+    /// `create_account_with_seed` 自建的那个 token account。
+    ///
+    /// 只有金额的话，卖出侧无法判断该 `close` 哪个账户、或把指令里写死的 ATA 改写到哪。
+    /// 与金额来自**同一个 `BalanceChange`**（在 `add_success_trade` 里一起写入），永远同源。
+    #[serde(default)]
+    pub last_base_token_account: Pubkey,
 }
 
 impl TokenPnl {
@@ -67,6 +74,7 @@ impl TokenPnl {
         sol_gas: i128,
         base_change: i128,
         base_after_balance: u64,
+        base_token_account: Pubkey,
         quote_mint: Pubkey,
         payer: Pubkey,
         slot: u64,
@@ -76,6 +84,8 @@ impl TokenPnl {
         self.sol_gas_cost += sol_gas;
         self.base_position += base_change;
         self.last_base_after_balance = base_after_balance;
+        // 账户与金额同一个 `BalanceChange` 进来，保证两个字段不会错配。
+        self.last_base_token_account = base_token_account;
         self.success_tx_count += 1;
         self.last_slot = slot;
 
@@ -124,7 +134,7 @@ pub struct SettledTokenPnlDetail {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalanceSnapshot {
     pub amount: u64,
-    /// 余额所在账户。原生 SOL 时为 [`Pubkey::default`]（哨兵：余额在钱包本身，不是 token account）。
+    /// 余额实际所在的 token account（ATA 或 `create_account_with_seed` 自建账户）。
     pub token_account: Pubkey,
 }
 
@@ -137,15 +147,6 @@ pub struct PnlTracker {
     /// 不会与任何 SPL mint 冲突。给买入侧当 `pre_balance` 快照用 ——
     /// 省掉热路径里一次 `get_balance` RPC。
     sol_balances: RwLock<HashMap<Pubkey, u64>>,
-    /// **余额来源账户镜像**：`(payer, mint) -> 最近一次 `BalanceChange.token_account``。
-    ///
-    /// 与 `cache` / `sol_balances` 里的金额**同步写入**，配套 [`PnlTracker::query_balance_with_account`]。
-    ///
-    /// ⚠️ **刻意不做持久化**：`TokenPnl` 是用 `SerdeBincode` 存的，给它加字段会让存量
-    /// LMDB 条目（bincode 非自描述）整体解码失败、被 `with_db_path` 静默跳过 —— 为了一个
-    /// 新接口把现网 PnL 历史清掉不值得。代价是进程重启后本表为空，此时新接口会退化成
-    /// 「查链上」（多一次 RPC），**不会**给出错误的账户。
-    balance_accounts: RwLock<HashMap<(Pubkey, Pubkey), Pubkey>>,
     db: Option<PnlDb>,
     latest_slot: AtomicU64,
     /// 清仓结算回调：key=payer，仓位清零时 spawn 对应 payer 的所有回调
@@ -202,12 +203,21 @@ impl PnlTracker {
         };
 
         let mut cache = HashMap::new();
+        // 旧布局（`TokenPnl` 加 `last_base_token_account` 之前）的条目会因为 bincode
+        // 非自描述而解码失败。**不做迁移，直接跳过** —— 那些 (payer, mint) 的统计
+        // 从下一笔观察到的交易重新开始，不影响运行。
+        let mut skipped_legacy = 0usize;
         if let Some(db_ref) = db.as_ref() {
             if let Ok(rtxn) = db_ref.env.read_txn()
                 && let Ok(iter) = db_ref.db.iter(&rtxn)
             {
                 for item in iter {
-                    let Ok((key, pnl)) = item else { continue };
+                    let Ok((key, pnl)) = item else {
+                        // heed 的迭代器先移动游标再解码，所以这里 continue 之后
+                        // 后面的条目照常读得到，不会卡在坏条目上。
+                        skipped_legacy += 1;
+                        continue;
+                    };
                     let Ok(key_str) = std::str::from_utf8(key) else {
                         continue;
                     };
@@ -222,13 +232,19 @@ impl PnlTracker {
                     cache.insert((payer, mint), pnl);
                 }
             }
+            if skipped_legacy > 0 {
+                warn!(
+                    "[pnl-tracker] 跳过 {} 条旧布局条目（TokenPnl 新增 last_base_token_account，bincode 布局已变）。\
+                     这些 (payer, mint) 的 PnL 统计会从下一笔交易重新累计。",
+                    skipped_legacy
+                );
+            }
         }
 
         Self {
             targets: RwLock::new(HashSet::new()),
             cache: RwLock::new(cache),
             sol_balances: RwLock::new(HashMap::new()),
-            balance_accounts: RwLock::new(HashMap::new()),
             db,
             latest_slot: AtomicU64::new(0),
             settle_callbacks: RwLock::new(HashMap::new()),
@@ -297,7 +313,7 @@ impl PnlTracker {
         self.sol_balances.read().await.get(payer).copied()
     }
 
-    /// **缓存优先 + 来源账户**的余额查询。
+    /// **缓存优先 + 来源账户**的余额查询（服务 SPL 代币，也就是 `mint != Pubkey::default()`）。
     ///
     /// # 为什么需要它
     ///
@@ -310,9 +326,9 @@ impl PnlTracker {
     ///
     /// # 取值顺序
     ///
-    /// 1. **事件镜像命中**：`(payer, mint)` 在 `balance_accounts` 里有账户记录，
-    ///    且对应金额也在（`mint == Pubkey::default()` 取 `sol_balances`，否则取 `cache`
-    ///    的 `last_base_after_balance`）→ 直接返回，**不发 RPC**。
+    /// 1. **镜像命中**：`cache` 里有 `(payer, mint)` 的 [`TokenPnl`]（且已经记过至少一笔交易）
+    ///    → 直接返回它的 `last_base_after_balance` + `last_base_token_account`，**不发 RPC**。
+    ///    这两个字段同源持久化在 LMDB，所以**进程重启后依然命中**。
     /// 2. 否则按 `candidates()` 的顺序逐个查链上，返回**第一个余额 > 0** 的账户。
     /// 3. 没有 > 0 的，但某个账户明确返回 `Some(0)` → 返回该账户 + 金额 0
     ///    （调用方可据此区分「确实空了」与「查不出来」，参考 `alt_sniper` 的 `Some(0)` vs `None` 语义）。
@@ -320,8 +336,15 @@ impl PnlTracker {
     ///
     /// # 不写回缓存
     ///
-    /// 链上结果**不**回填 `balance_accounts` / `cache`：那些结构是 gRPC 事件流的镜像，
-    /// 混入 RPC 快照会让「镜像可能落后于链上」这个前提失效（见 [`Self::query_sol_balance`] 的说明）。
+    /// 链上结果**不**回填 `cache`：它是 gRPC 事件流的镜像，混入 RPC 快照会让
+    /// 「镜像可能落后于链上」这个前提失效（见 [`Self::query_sol_balance`] 的说明）。
+    ///
+    /// # 原生 SOL
+    ///
+    /// 原生 SOL 没有 token account 的概念（`token_account` 会是 `Pubkey::default()`，
+    /// 对卖出侧没有意义），所以本接口不处理 `mint == Pubkey::default()` ——
+    /// 那条路径用 [`Self::query_sol_balance`]。传 `Pubkey::default()` 进来会直接走
+    /// `candidates()` 分支。
     ///
     /// # 例子（暂未接线，供迁移时参考）
     ///
@@ -350,21 +373,17 @@ impl PnlTracker {
         C: FnOnce() -> CFut,
         CFut: std::future::Future<Output = Vec<Pubkey>>,
     {
-        // ── 1. 事件镜像：先取出账户就释放读锁 ──
-        let mirrored_account = self.balance_accounts.read().await.get(&(*payer, *mint)).copied();
-        if let Some(token_account) = mirrored_account {
-            let mirrored_amount = if *mint == Pubkey::default() {
-                self.sol_balances.read().await.get(payer).copied()
-            } else {
-                self.cache
-                    .read()
-                    .await
-                    .get(&(*payer, *mint))
-                    .map(|pnl| pnl.last_base_after_balance)
-            };
-            if let Some(amount) = mirrored_amount {
-                return Some(BalanceSnapshot { amount, token_account });
-            }
+        // ── 1. 事件流镜像（持久化的 TokenPnl）──
+        if let Some(pnl) = self.cache.read().await.get(&(*payer, *mint))
+            // 账户解析失败（`account_index` 越界等）时 `BalanceChange.token_account` 是 `default()`。
+            // 把它当成"一个账户"返回给调用方很危险（拿去 close 会指向 system program id），
+            // 所以这种情况一律当作 miss，交给 `candidates()` 走链上。
+            && pnl.last_base_token_account != Pubkey::default()
+        {
+            return Some(BalanceSnapshot {
+                amount: pnl.last_base_after_balance,
+                token_account: pnl.last_base_token_account,
+            });
         }
 
         // ── 2. 链上兜底：候选账户由上游注入 ──
@@ -534,11 +553,6 @@ impl PnlTracker {
         // 放在 `base_change` 早退之前 —— 否则 SOL-only 的交易会被漏掉。
         if let Some(sol) = self_changes.iter().find(|c| c.mint == Pubkey::default()) {
             self.sol_balances.write().await.insert(target, sol.after_balance);
-            // 一并记下来源账户（原生 SOL 时是 `Pubkey::default()` 哨兵）。
-            self.balance_accounts
-                .write()
-                .await
-                .insert((target, Pubkey::default()), sol.token_account);
         }
 
         let (quote_mint, quote_change) = select_quote_change(&self_changes);
@@ -549,9 +563,6 @@ impl PnlTracker {
         else {
             return;
         };
-        // 余额来源账户：与 `last_base_after_balance` 同源（同一个 `BalanceChange`），
-        // 在 `drop(cache)` 之后写入 `balance_accounts`，避免与读路径形成交叉锁序。
-        let base_token_account = base_change.token_account;
 
         let is_sol_based = quote_mint == Pubkey::default() || quote_mint == *WSOL_MINT;
         let sol_gas = if !is_sol_based {
@@ -580,6 +591,7 @@ impl PnlTracker {
             sol_gas,
             base_change.change,
             base_change.after_balance,
+            base_change.token_account,
             quote_mint,
             target,
             slot,
@@ -608,13 +620,6 @@ impl PnlTracker {
 
         // 释放写锁后再触发回调，避免死锁
         drop(cache);
-
-        // 记录「这笔余额记在哪个账户上」。放在 `drop(cache)` 之后：读路径是
-        // `balance_accounts` → `cache` 的顺序，这里保持 cache 先释放，避免锁序交叉。
-        self.balance_accounts
-            .write()
-            .await
-            .insert((target, base_change.mint), base_token_account);
 
         if let Some(payload) = settled_payload {
             let cbs = self.settle_callbacks.read().await;
