@@ -313,6 +313,26 @@ impl PnlTracker {
         self.sol_balances.read().await.get(payer).copied()
     }
 
+    /// **只读内存镜像**（**不碰 RPC、不碰磁盘**，立即返回）。
+    ///
+    /// 返回最近一次为 `(payer, mint)` 观察到的 base 余额，以及它记在哪个账户上。
+    /// 数据源是 `cache`（内存 `HashMap`）：启动时由 LMDB 预热，之后随 gRPC 事件流更新。
+    ///
+    /// ⚠️ `token_account` 可能是 [`Pubkey::default()`] —— 那是 `BalanceChange.token_account`
+    /// **解析失败**（`account_index` 越界等）的标记，此时**只有 `amount` 可信**。
+    /// 要把账户拿去构造 / 改写指令，请用 [`Self::query_balance_with_account`]，
+    /// 它会把这种情况当成 miss、改走链上，绝不会把 `default()` 当账户交出去。
+    ///
+    /// `None` = 镜像里根本没有这个 `(payer, mint)`（没注册成 target，或还没观察到任何余额变化）。
+    pub async fn query_balance_mirror(&self, payer: &Pubkey, mint: &Pubkey) -> Option<BalanceSnapshot> {
+        let cache = self.cache.read().await;
+        let pnl = cache.get(&(*payer, *mint))?;
+        Some(BalanceSnapshot {
+            amount: pnl.last_base_after_balance,
+            token_account: pnl.last_base_token_account,
+        })
+    }
+
     /// **缓存优先 + 来源账户**的余额查询（服务 SPL 代币，也就是 `mint != Pubkey::default()`）。
     ///
     /// # 为什么需要它
@@ -326,9 +346,10 @@ impl PnlTracker {
     ///
     /// # 取值顺序
     ///
-    /// 1. **镜像命中**：`cache` 里有 `(payer, mint)` 的 [`TokenPnl`]（且已经记过至少一笔交易）
+    /// 1. **镜像命中**：内存 `cache` 里有 `(payer, mint)` 的 [`TokenPnl`]（且已经记过至少一笔交易）
     ///    → 直接返回它的 `last_base_after_balance` + `last_base_token_account`，**不发 RPC**。
-    ///    这两个字段同源持久化在 LMDB，所以**进程重启后依然命中**。
+    ///    这个 `cache` 在启动时由 LMDB 预热、之后随事件流更新，读路径**只碰内存**；
+    ///    所以**进程重启后依然命中**，不会退化成第一次就查链。
     /// 2. 否则按 `candidates()` 的顺序逐个查链上，返回**第一个余额 > 0** 的账户。
     /// 3. 没有 > 0 的，但某个账户明确返回 `Some(0)` → 返回该账户 + 金额 0
     ///    （调用方可据此区分「确实空了」与「查不出来」，参考 `alt_sniper` 的 `Some(0)` vs `None` 语义）。
@@ -373,17 +394,14 @@ impl PnlTracker {
         C: FnOnce() -> CFut,
         CFut: std::future::Future<Output = Vec<Pubkey>>,
     {
-        // ── 1. 事件流镜像（持久化的 TokenPnl）──
-        if let Some(pnl) = self.cache.read().await.get(&(*payer, *mint))
-            // 账户解析失败（`account_index` 越界等）时 `BalanceChange.token_account` 是 `default()`。
-            // 把它当成"一个账户"返回给调用方很危险（拿去 close 会指向 system program id），
-            // 所以这种情况一律当作 miss，交给 `candidates()` 走链上。
-            && pnl.last_base_token_account != Pubkey::default()
+        // ── 1. 内存镜像（TokenPnl 写穿到 LMDB，启动时由 LMDB 预热）──
+        if let Some(snap) = self.query_balance_mirror(payer, mint).await
+            // 账户解析失败时 `token_account` 是 `default()`。把它当"一个账户"返回给调用方
+            // 很危险（拿去 close 会指向 system program id），所以这种情况一律当作 miss，
+            // 交给 `candidates()` 走链上。
+            && snap.token_account != Pubkey::default()
         {
-            return Some(BalanceSnapshot {
-                amount: pnl.last_base_after_balance,
-                token_account: pnl.last_base_token_account,
-            });
+            return Some(snap);
         }
 
         // ── 2. 链上兜底：候选账户由上游注入 ──
@@ -710,6 +728,14 @@ pub async fn query_token_pnl(payer: &Pubkey, mint: &Pubkey) -> Option<TokenPnl> 
 /// `None` = 启动后还没观察过该 payer（调用方自行回落 RPC）。
 pub async fn sol_balance(payer: &Pubkey) -> Option<u64> {
     global_tracker().query_sol_balance(payer).await
+}
+
+/// 全局 tracker 的 [`PnlTracker::query_balance_mirror`]。
+///
+/// **不碰 RPC**：镜像没有就返回 `None`，适合放在「先看内存、miss 再决定要不要花钱查链」
+/// 的热路径上。
+pub async fn balance_mirror(payer: &Pubkey, mint: &Pubkey) -> Option<BalanceSnapshot> {
+    global_tracker().query_balance_mirror(payer, mint).await
 }
 
 /// 全局 tracker 的 [`PnlTracker::query_balance_with_account`]。
