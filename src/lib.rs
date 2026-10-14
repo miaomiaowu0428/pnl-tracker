@@ -126,11 +126,14 @@ pub struct SettledTokenPnlDetail {
     pub last_slot: u64,
 }
 
-/// 一次余额查询的结果：**金额 + 余额实际落在哪个账户**。
+/// 「某个账户上有多少余额」这一对：**金额 + 账户**。
 ///
 /// 只有金额是不够的 —— 同一个 `(owner, mint)` 的仓位可能落在 ATA，
 /// 也可能落在 `create_account_with_seed` 自建的 token account 里。
 /// 卖出侧拿不到「是哪个账户」就无法决定该去 close 哪个账户、或往哪条指令上改写。
+///
+/// 查余额的入口 [`PnlTracker::query_balances`] 返回的是它的 `Vec`（**所有**有正余额的账户），
+/// 由调用方自己挑。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalanceSnapshot {
     pub amount: u64,
@@ -320,7 +323,7 @@ impl PnlTracker {
     ///
     /// ⚠️ `token_account` 可能是 [`Pubkey::default()`] —— 那是 `BalanceChange.token_account`
     /// **解析失败**（`account_index` 越界等）的标记，此时**只有 `amount` 可信**。
-    /// 要把账户拿去构造 / 改写指令，请用 [`Self::query_balance_with_account`]，
+    /// 要把账户拿去构造 / 改写指令，请用 [`Self::query_balances`]，
     /// 它会把这种情况当成 miss、改走链上，绝不会把 `default()` 当账户交出去。
     ///
     /// `None` = 镜像里根本没有这个 `(payer, mint)`（没注册成 target，或还没观察到任何余额变化）。
@@ -333,27 +336,26 @@ impl PnlTracker {
         })
     }
 
-    /// **缓存优先 + 来源账户**的余额查询（服务 SPL 代币，也就是 `mint != Pubkey::default()`）。
+    /// **把 `(payer, mint)` 的余额尽量查全**：返回**所有**查到有正余额的账户。
     ///
-    /// # 为什么需要它
+    /// # 职责边界
     ///
-    /// 老接口只给金额，调用方在缓存 miss 时只能自己回落到「按 ATA 派生地址查 RPC」。
-    /// 仓位若在 `create_account_with_seed` 自建账户里，那条回落路径会**稳定读到 0**，
-    /// 而上层通常把 0 当成「已清仓」→ 不卖 → 仓位烂在链上。
-    ///
-    /// 本接口把回落路径的**账户来源**交还给上游：候选账户由 `candidates` 闭包注入
-    /// （例如 `[ata, seed_account]`），返回结果里带上「余额实际落在哪个账户」。
+    /// 本接口**不挑**账户、不做优先级、不替调用方决定该用哪个 —— 它只负责
+    /// 「尽可能完整地查」，把「余额落在哪几个账户」如实交回，由调用方自己筛
+    /// （比如卖出侧只认自己的 seed 账户，那它自己 `find`）。
     ///
     /// # 取值顺序
     ///
-    /// 1. **镜像命中**：内存 `cache` 里有 `(payer, mint)` 的 [`TokenPnl`]（且已经记过至少一笔交易）
-    ///    → 直接返回它的 `last_base_after_balance` + `last_base_token_account`，**不发 RPC**。
-    ///    这个 `cache` 在启动时由 LMDB 预热、之后随事件流更新，读路径**只碰内存**；
-    ///    所以**进程重启后依然命中**，不会退化成第一次就查链。
-    /// 2. 否则按 `candidates()` 的顺序逐个查链上，返回**第一个余额 > 0** 的账户。
-    /// 3. 没有 > 0 的，但某个账户明确返回 `Some(0)` → 返回该账户 + 金额 0
-    ///    （调用方可据此区分「确实空了」与「查不出来」，参考 `alt_sniper` 的 `Some(0)` vs `None` 语义）。
-    /// 4. 全部查不到（账户不存在 / RPC 报错）→ `None`。
+    /// 1. **内存镜像命中**（`cache` 里有 `(payer, mint)` 且账户已知）→ 直接返回镜像里那一对，
+    ///    **不发 RPC**。这个 `cache` 启动时由 LMDB 预热、之后随事件流更新，读路径只碰内存。
+    ///    ⚠️ 镜像上游按 `(owner, mint)` 折叠，**天然单值**，所以缓存最多只能给回 **1** 个账户；
+    ///    「多个账户都有余额」这种情况只有走第 2 步才看得见。
+    /// 2. 否则把 `accounts` **全部**查一遍（**不早退** —— 早退就收不全），返回所有 `amount > 0` 的。
+    ///
+    /// # 会丢的信息
+    ///
+    /// 返回 `Vec` 区分不了「查了、确实没余额」和「账户不存在 / RPC 查不到」—— 两者都是空 `Vec`。
+    /// 需要这个区分的老调用方（如 `alt_sniper` 依赖的 `Some(0)` vs `None`）暂时仍用原接口。
     ///
     /// # 不写回缓存
     ///
@@ -362,63 +364,40 @@ impl PnlTracker {
     ///
     /// # 原生 SOL
     ///
-    /// 原生 SOL 没有 token account 的概念（`token_account` 会是 `Pubkey::default()`，
-    /// 对卖出侧没有意义），所以本接口不处理 `mint == Pubkey::default()` ——
-    /// 那条路径用 [`Self::query_sol_balance`]。传 `Pubkey::default()` 进来会直接走
-    /// `candidates()` 分支。
+    /// 原生 SOL 没有 token account 的概念，不在本接口范围内 —— 用 [`Self::query_sol_balance`]。
     ///
     /// # 例子（暂未接线，供迁移时参考）
     ///
     /// ```ignore
-    /// let snap = tracker.query_balance_with_account(
-    ///     &payer,
-    ///     &mint,
-    ///     || async {
-    ///         vec![
-    ///             get_associated_token_address_with_program_id(&payer, &mint, &program),
-    ///             seed_token_account(&payer, &mint, &program),
-    ///         ]
-    ///     },
-    ///     &rpc,
-    /// ).await;
-    /// // snap.map(|s| s.amount) / snap.map(|s| s.token_account)
+    /// let found = tracker.query_balances(&payer, &mint, vec![ata, seed, extra], &rpc).await;
+    /// // 调用方自己挑该用哪个：
+    /// let on_my_account = found.iter().find(|s| s.token_account == my_account);
     /// ```
-    pub async fn query_balance_with_account<C, CFut>(
+    pub async fn query_balances(
         &self,
         payer: &Pubkey,
         mint: &Pubkey,
-        candidates: C,
+        accounts: Vec<Pubkey>,
         rpc: &solana_client::nonblocking::rpc_client::RpcClient,
-    ) -> Option<BalanceSnapshot>
-    where
-        C: FnOnce() -> CFut,
-        CFut: std::future::Future<Output = Vec<Pubkey>>,
-    {
-        // ── 1. 内存镜像（TokenPnl 写穿到 LMDB，启动时由 LMDB 预热）──
+    ) -> Vec<BalanceSnapshot> {
+        // ── 1. 内存镜像：有记录就以它为准 ──
         if let Some(snap) = self.query_balance_mirror(payer, mint).await
-            // 账户解析失败时 `token_account` 是 `default()`。把它当"一个账户"返回给调用方
-            // 很危险（拿去 close 会指向 system program id），所以这种情况一律当作 miss，
-            // 交给 `candidates()` 走链上。
+            // 账户解析失败时是 `default()` —— 不是有效账户，当作没有镜像，去查链上。
             && snap.token_account != Pubkey::default()
         {
-            return Some(snap);
+            return if snap.amount > 0 { vec![snap] } else { Vec::new() };
         }
 
-        // ── 2. 链上兜底：候选账户由上游注入 ──
-        let mut confirmed_zero: Option<BalanceSnapshot> = None;
-        for token_account in candidates().await {
-            match utils::get_ata_balance(&token_account, rpc).await {
-                Some(amount) if amount > 0 => {
-                    return Some(BalanceSnapshot { amount, token_account });
-                }
-                Some(_) => {
-                    // 账户存在但余额为 0 —— 记下来，全部候选都查完还没有正余额时返回它。
-                    confirmed_zero.get_or_insert(BalanceSnapshot { amount: 0, token_account });
-                }
-                None => {}
+        // ── 2. 链上：把给到的账户**全部**查完，不早退 ──
+        let mut found = Vec::new();
+        for token_account in accounts {
+            if let Some(amount) = utils::get_ata_balance(&token_account, rpc).await
+                && amount > 0
+            {
+                found.push(BalanceSnapshot { amount, token_account });
             }
         }
-        confirmed_zero
+        found
     }
 
     pub async fn query_settled_token_pnl_detail(
@@ -738,23 +717,18 @@ pub async fn balance_mirror(payer: &Pubkey, mint: &Pubkey) -> Option<BalanceSnap
     global_tracker().query_balance_mirror(payer, mint).await
 }
 
-/// 全局 tracker 的 [`PnlTracker::query_balance_with_account`]。
+/// 全局 tracker 的 [`PnlTracker::query_balances`]。
 ///
-/// 缓存优先；miss 时按 `candidates` 的顺序查链上。候选账户（ATA / seed 派生账户）
-/// 由调用方自己注入 —— 这个 crate 不关心账户是怎么派生的。
-pub async fn balance_with_account<C, CFut>(
+/// 缓存优先；miss 时把 `accounts` 全查一遍，返回**所有**有正余额的账户。
+/// 账户清单（ATA / seed 派生账户 / 别的）由调用方给全 —— 这个 crate 不关心账户怎么派生，
+/// 也不替调用方挑该用哪个。
+pub async fn query_balances(
     payer: &Pubkey,
     mint: &Pubkey,
-    candidates: C,
+    accounts: Vec<Pubkey>,
     rpc: &solana_client::nonblocking::rpc_client::RpcClient,
-) -> Option<BalanceSnapshot>
-where
-    C: FnOnce() -> CFut,
-    CFut: std::future::Future<Output = Vec<Pubkey>>,
-{
-    global_tracker()
-        .query_balance_with_account(payer, mint, candidates, rpc)
-        .await
+) -> Vec<BalanceSnapshot> {
+    global_tracker().query_balances(payer, mint, accounts, rpc).await
 }
 
 pub async fn query_settled_token_pnl_detail(
