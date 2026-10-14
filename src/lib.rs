@@ -116,6 +116,18 @@ pub struct SettledTokenPnlDetail {
     pub last_slot: u64,
 }
 
+/// 一次余额查询的结果：**金额 + 余额实际落在哪个账户**。
+///
+/// 只有金额是不够的 —— 同一个 `(owner, mint)` 的仓位可能落在 ATA，
+/// 也可能落在 `create_account_with_seed` 自建的 token account 里。
+/// 卖出侧拿不到「是哪个账户」就无法决定该去 close 哪个账户、或往哪条指令上改写。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalanceSnapshot {
+    pub amount: u64,
+    /// 余额所在账户。原生 SOL 时为 [`Pubkey::default`]（哨兵：余额在钱包本身，不是 token account）。
+    pub token_account: Pubkey,
+}
+
 pub struct PnlTracker {
     targets: RwLock<HashSet<Pubkey>>,
     cache: RwLock<HashMap<(Pubkey, Pubkey), TokenPnl>>,
@@ -125,6 +137,15 @@ pub struct PnlTracker {
     /// 不会与任何 SPL mint 冲突。给买入侧当 `pre_balance` 快照用 ——
     /// 省掉热路径里一次 `get_balance` RPC。
     sol_balances: RwLock<HashMap<Pubkey, u64>>,
+    /// **余额来源账户镜像**：`(payer, mint) -> 最近一次 `BalanceChange.token_account``。
+    ///
+    /// 与 `cache` / `sol_balances` 里的金额**同步写入**，配套 [`PnlTracker::query_balance_with_account`]。
+    ///
+    /// ⚠️ **刻意不做持久化**：`TokenPnl` 是用 `SerdeBincode` 存的，给它加字段会让存量
+    /// LMDB 条目（bincode 非自描述）整体解码失败、被 `with_db_path` 静默跳过 —— 为了一个
+    /// 新接口把现网 PnL 历史清掉不值得。代价是进程重启后本表为空，此时新接口会退化成
+    /// 「查链上」（多一次 RPC），**不会**给出错误的账户。
+    balance_accounts: RwLock<HashMap<(Pubkey, Pubkey), Pubkey>>,
     db: Option<PnlDb>,
     latest_slot: AtomicU64,
     /// 清仓结算回调：key=payer，仓位清零时 spawn 对应 payer 的所有回调
@@ -207,6 +228,7 @@ impl PnlTracker {
             targets: RwLock::new(HashSet::new()),
             cache: RwLock::new(cache),
             sol_balances: RwLock::new(HashMap::new()),
+            balance_accounts: RwLock::new(HashMap::new()),
             db,
             latest_slot: AtomicU64::new(0),
             settle_callbacks: RwLock::new(HashMap::new()),
@@ -273,6 +295,93 @@ impl PnlTracker {
     /// 不会超买；偏新（偏低）才可能超买，那需要该 payer 在两次观察之间**收到** SOL。
     pub async fn query_sol_balance(&self, payer: &Pubkey) -> Option<u64> {
         self.sol_balances.read().await.get(payer).copied()
+    }
+
+    /// **缓存优先 + 来源账户**的余额查询。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 老接口只给金额，调用方在缓存 miss 时只能自己回落到「按 ATA 派生地址查 RPC」。
+    /// 仓位若在 `create_account_with_seed` 自建账户里，那条回落路径会**稳定读到 0**，
+    /// 而上层通常把 0 当成「已清仓」→ 不卖 → 仓位烂在链上。
+    ///
+    /// 本接口把回落路径的**账户来源**交还给上游：候选账户由 `candidates` 闭包注入
+    /// （例如 `[ata, seed_account]`），返回结果里带上「余额实际落在哪个账户」。
+    ///
+    /// # 取值顺序
+    ///
+    /// 1. **事件镜像命中**：`(payer, mint)` 在 `balance_accounts` 里有账户记录，
+    ///    且对应金额也在（`mint == Pubkey::default()` 取 `sol_balances`，否则取 `cache`
+    ///    的 `last_base_after_balance`）→ 直接返回，**不发 RPC**。
+    /// 2. 否则按 `candidates()` 的顺序逐个查链上，返回**第一个余额 > 0** 的账户。
+    /// 3. 没有 > 0 的，但某个账户明确返回 `Some(0)` → 返回该账户 + 金额 0
+    ///    （调用方可据此区分「确实空了」与「查不出来」，参考 `alt_sniper` 的 `Some(0)` vs `None` 语义）。
+    /// 4. 全部查不到（账户不存在 / RPC 报错）→ `None`。
+    ///
+    /// # 不写回缓存
+    ///
+    /// 链上结果**不**回填 `balance_accounts` / `cache`：那些结构是 gRPC 事件流的镜像，
+    /// 混入 RPC 快照会让「镜像可能落后于链上」这个前提失效（见 [`Self::query_sol_balance`] 的说明）。
+    ///
+    /// # 例子（暂未接线，供迁移时参考）
+    ///
+    /// ```ignore
+    /// let snap = tracker.query_balance_with_account(
+    ///     &payer,
+    ///     &mint,
+    ///     || async {
+    ///         vec![
+    ///             get_associated_token_address_with_program_id(&payer, &mint, &program),
+    ///             seed_token_account(&payer, &mint, &program),
+    ///         ]
+    ///     },
+    ///     &rpc,
+    /// ).await;
+    /// // snap.map(|s| s.amount) / snap.map(|s| s.token_account)
+    /// ```
+    pub async fn query_balance_with_account<C, CFut>(
+        &self,
+        payer: &Pubkey,
+        mint: &Pubkey,
+        candidates: C,
+        rpc: &solana_client::nonblocking::rpc_client::RpcClient,
+    ) -> Option<BalanceSnapshot>
+    where
+        C: FnOnce() -> CFut,
+        CFut: std::future::Future<Output = Vec<Pubkey>>,
+    {
+        // ── 1. 事件镜像：先取出账户就释放读锁 ──
+        let mirrored_account = self.balance_accounts.read().await.get(&(*payer, *mint)).copied();
+        if let Some(token_account) = mirrored_account {
+            let mirrored_amount = if *mint == Pubkey::default() {
+                self.sol_balances.read().await.get(payer).copied()
+            } else {
+                self.cache
+                    .read()
+                    .await
+                    .get(&(*payer, *mint))
+                    .map(|pnl| pnl.last_base_after_balance)
+            };
+            if let Some(amount) = mirrored_amount {
+                return Some(BalanceSnapshot { amount, token_account });
+            }
+        }
+
+        // ── 2. 链上兜底：候选账户由上游注入 ──
+        let mut confirmed_zero: Option<BalanceSnapshot> = None;
+        for token_account in candidates().await {
+            match utils::get_ata_balance(&token_account, rpc).await {
+                Some(amount) if amount > 0 => {
+                    return Some(BalanceSnapshot { amount, token_account });
+                }
+                Some(_) => {
+                    // 账户存在但余额为 0 —— 记下来，全部候选都查完还没有正余额时返回它。
+                    confirmed_zero.get_or_insert(BalanceSnapshot { amount: 0, token_account });
+                }
+                None => {}
+            }
+        }
+        confirmed_zero
     }
 
     pub async fn query_settled_token_pnl_detail(
@@ -425,6 +534,11 @@ impl PnlTracker {
         // 放在 `base_change` 早退之前 —— 否则 SOL-only 的交易会被漏掉。
         if let Some(sol) = self_changes.iter().find(|c| c.mint == Pubkey::default()) {
             self.sol_balances.write().await.insert(target, sol.after_balance);
+            // 一并记下来源账户（原生 SOL 时是 `Pubkey::default()` 哨兵）。
+            self.balance_accounts
+                .write()
+                .await
+                .insert((target, Pubkey::default()), sol.token_account);
         }
 
         let (quote_mint, quote_change) = select_quote_change(&self_changes);
@@ -435,6 +549,9 @@ impl PnlTracker {
         else {
             return;
         };
+        // 余额来源账户：与 `last_base_after_balance` 同源（同一个 `BalanceChange`），
+        // 在 `drop(cache)` 之后写入 `balance_accounts`，避免与读路径形成交叉锁序。
+        let base_token_account = base_change.token_account;
 
         let is_sol_based = quote_mint == Pubkey::default() || quote_mint == *WSOL_MINT;
         let sol_gas = if !is_sol_based {
@@ -491,6 +608,13 @@ impl PnlTracker {
 
         // 释放写锁后再触发回调，避免死锁
         drop(cache);
+
+        // 记录「这笔余额记在哪个账户上」。放在 `drop(cache)` 之后：读路径是
+        // `balance_accounts` → `cache` 的顺序，这里保持 cache 先释放，避免锁序交叉。
+        self.balance_accounts
+            .write()
+            .await
+            .insert((target, base_change.mint), base_token_account);
 
         if let Some(payload) = settled_payload {
             let cbs = self.settle_callbacks.read().await;
@@ -581,6 +705,25 @@ pub async fn query_token_pnl(payer: &Pubkey, mint: &Pubkey) -> Option<TokenPnl> 
 /// `None` = 启动后还没观察过该 payer（调用方自行回落 RPC）。
 pub async fn sol_balance(payer: &Pubkey) -> Option<u64> {
     global_tracker().query_sol_balance(payer).await
+}
+
+/// 全局 tracker 的 [`PnlTracker::query_balance_with_account`]。
+///
+/// 缓存优先；miss 时按 `candidates` 的顺序查链上。候选账户（ATA / seed 派生账户）
+/// 由调用方自己注入 —— 这个 crate 不关心账户是怎么派生的。
+pub async fn balance_with_account<C, CFut>(
+    payer: &Pubkey,
+    mint: &Pubkey,
+    candidates: C,
+    rpc: &solana_client::nonblocking::rpc_client::RpcClient,
+) -> Option<BalanceSnapshot>
+where
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = Vec<Pubkey>>,
+{
+    global_tracker()
+        .query_balance_with_account(payer, mint, candidates, rpc)
+        .await
 }
 
 pub async fn query_settled_token_pnl_detail(

@@ -9,6 +9,9 @@ grpc-client = { git = "https://github.com/miaomiaowu0428/grpc-client.git", branc
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 solana-sdk = "4.0.1"
+# 只为新接口 `query_balance_with_account` 的 `&RpcClient` 参数引入；
+# 与 nonce_cache 锁在同一版本，避免同图里出现两份 solana-client。
+solana-client = "4.2.2"
 tokio = { version = "1", features = ["sync", "rt", "time"] }
 transaction-monitor = { git = "https://github.com/miaomiaowu0428/transaction-monitor.git", branch = "main" }
 utils = { git = "https://github.com/miaomiaowu0428/sol-utils.git", branch = "main" }
