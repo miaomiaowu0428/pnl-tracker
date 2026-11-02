@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
+use utils::tx_ctx::TxCtx;
 use grpc_client::TransactionFormat;
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, Env};
@@ -782,7 +783,7 @@ impl TxSubscriber for PnlTrackerSubscriber {
         Some(keys.iter().any(|k| targets.contains(k)))
     }
 
-    async fn on_tx(self: Arc<Self>, tx: Arc<TransactionFormat>) {
+    async fn on_tx(self: Arc<Self>, tx: Arc<TxCtx>) {
         if let Err(e) = self.tracker.process_tx(&tx).await {
             let sig = tx.transaction.signatures.first().copied().unwrap_or_default();
             warn!("[PnlTrackerSubscriber] process tx failed sig={} err={}", sig, e);
